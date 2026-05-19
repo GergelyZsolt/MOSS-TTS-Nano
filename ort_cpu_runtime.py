@@ -513,6 +513,57 @@ class OrtCpuRuntime:
             "attentionMask": [[1 for _ in rows]],
         }
 
+    def build_continuation_request_rows(
+        self,
+        text_token_ids: list[int],
+        prompt_audio_codes: list[list[int]] | None = None,
+        none_token_ids: list[int] | None = None,
+    ) -> dict[str, list[list[int]]]:
+        """Build input rows for continuation mode.
+
+        Continuation prompt layout (matching PyTorch build_inference_input_ids):
+            prompt_prefix + text_token_ids + assistant_prompt_prefix + audio_start
+            [+ optional assistant audio prefix rows]
+
+        where prompt_prefix = user_prompt_prefix + encode("None") + user_prompt_after_reference
+
+        Args:
+            text_token_ids: token IDs for the text to synthesize (prompt_text + target_text)
+            prompt_audio_codes: optional audio codes for continuation from existing audio
+            none_token_ids: token IDs for the literal string "None" used in the prompt prefix.
+                            If None, falls back to manifest["prompt_templates"].get("none_token_ids", []).
+        """
+        resolved_none_ids = (
+            list(none_token_ids) if none_token_ids is not None
+            else self.manifest["prompt_templates"].get("none_token_ids", [])
+        )
+        prompt_prefix_token_ids = (
+            list(self.manifest["prompt_templates"]["user_prompt_prefix_token_ids"])
+            + resolved_none_ids
+            + list(self.manifest["prompt_templates"]["user_prompt_after_reference_token_ids"])
+        )
+        text_section_token_ids = (
+            prompt_prefix_token_ids
+            + list(text_token_ids)
+            + list(self.manifest["prompt_templates"]["assistant_prompt_prefix_token_ids"])
+            + [int(self.manifest["tts_config"]["audio_start_token_id"])]
+        )
+        rows = [self.build_text_rows(text_section_token_ids)]
+        if prompt_audio_codes:
+            rows.append(
+                self.build_audio_prefix_rows(
+                    prompt_audio_codes,
+                    slot_token_id=int(self.manifest["tts_config"]["audio_assistant_slot_token_id"]),
+                )
+            )
+        all_rows = []
+        for row_group in rows:
+            all_rows.extend(row_group)
+        return {
+            "inputIds": all_rows,
+            "attentionMask": [[1 for _ in all_rows]],
+        }
+
     def run_local_decoder(self, global_hidden: np.ndarray, text_token_id: int, frame_prefix: list[int]) -> tuple[np.ndarray, np.ndarray]:
         n_vq = int(self.manifest["tts_config"]["n_vq"])
         audio_pad = int(self.manifest["tts_config"]["audio_pad_token_id"])

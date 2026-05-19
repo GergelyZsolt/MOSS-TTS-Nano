@@ -149,13 +149,14 @@ class OnnxNanoTTSServiceAdapter:
         voice: str | None,
         prompt_audio_path: str | None,
         text_chunks: list[str],
+        mode: str = "voice_clone",
     ) -> dict[str, object]:
         return {
             "audio_path": audio_path,
             "waveform_numpy": np.asarray(waveform, dtype=np.float32),
             "sample_rate": int(sample_rate),
             "elapsed_seconds": float(elapsed_seconds),
-            "mode": "voice_clone",
+            "mode": mode,
             "voice": str(voice or ""),
             "prompt_audio_path": str(prompt_audio_path or ""),
             "voice_clone_text_chunks": list(text_chunks),
@@ -172,6 +173,7 @@ class OnnxNanoTTSServiceAdapter:
         mode: str,
         voice: str | None,
         prompt_audio_path: str | None,
+        prompt_text: str | None = None,
         max_new_frames: int,
         voice_clone_max_text_tokens: int,
         tts_max_batch_size: int = 0,
@@ -187,7 +189,8 @@ class OnnxNanoTTSServiceAdapter:
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
     ) -> dict[str, object]:
-        del mode, tts_max_batch_size, codec_max_batch_size
+        del tts_max_batch_size, codec_max_batch_size
+        normalized_mode = str(mode or "voice_clone").strip().lower() or "voice_clone"
         resolved_sample_mode = self._resolve_sample_mode(attn_implementation, do_sample=do_sample)
         self._apply_generation_options(
             sample_mode=resolved_sample_mode,
@@ -207,11 +210,13 @@ class OnnxNanoTTSServiceAdapter:
             text=str(text or ""),
             voice=voice,
             prompt_audio_path=prompt_audio_path,
+            prompt_text=prompt_text,
             sample_mode=resolved_sample_mode,
             do_sample=resolved_sample_mode != "greedy",
             streaming=False,
             max_new_frames=int(max_new_frames),
             voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
+            mode=normalized_mode,
             enable_wetext=False,
             enable_normalize_tts_text=False,
             seed=seed,
@@ -226,6 +231,7 @@ class OnnxNanoTTSServiceAdapter:
             voice=voice,
             prompt_audio_path=prompt_audio_path,
             text_chunks=[str(chunk).strip() for chunk in result.get("text_chunks", []) if str(chunk).strip()],
+            mode=normalized_mode,
         )
 
     def synthesize_stream(
@@ -235,6 +241,7 @@ class OnnxNanoTTSServiceAdapter:
         mode: str,
         voice: str | None,
         prompt_audio_path: str | None,
+        prompt_text: str | None = None,
         max_new_frames: int,
         voice_clone_max_text_tokens: int,
         tts_max_batch_size: int = 0,
@@ -250,7 +257,8 @@ class OnnxNanoTTSServiceAdapter:
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
     ) -> Iterator[dict[str, object]]:
-        del mode, tts_max_batch_size, codec_max_batch_size
+        del tts_max_batch_size, codec_max_batch_size
+        normalized_mode = str(mode or "voice_clone").strip().lower() or "voice_clone"
         event_queue: "queue.Queue[dict[str, object] | None]" = queue.Queue(maxsize=128)
 
         def _worker() -> None:
@@ -270,94 +278,30 @@ class OnnxNanoTTSServiceAdapter:
                     seed=seed,
                 )
                 start_time = time.perf_counter()
-                prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
-                text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
                 sample_rate = int(self.runtime.codec_meta["codec_config"]["sample_rate"])
                 channels = int(self.runtime.codec_meta["codec_config"]["channels"])
-                emitted_samples_total = 0
-                first_audio_emitted_at_perf: float | None = None
-                all_waveforms: list[np.ndarray] = []
-                all_generated_frames: list[list[int]] = []
 
-                for chunk_index, chunk_text in enumerate(text_chunks):
-                    text_token_ids = self.runtime.encode_text(chunk_text)
-                    request_rows = self.runtime.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
-                    pending_decode_frames: list[list[int]] = []
-                    emitted_chunks: list[np.ndarray] = []
-                    self.runtime.codec_streaming_session.reset()
+                if normalized_mode == "continuation":
+                    waveform, text_chunks = self._synthesize_stream_continuation_worker(
+                        text=text,
+                        prompt_text=prompt_text,
+                        prompt_audio_path=prompt_audio_path,
+                        voice=voice,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        event_queue=event_queue,
+                    )
+                else:
+                    waveform, text_chunks = self._synthesize_stream_voice_clone_worker(
+                        text=text,
+                        prompt_audio_path=prompt_audio_path,
+                        voice=voice,
+                        voice_clone_max_text_tokens=voice_clone_max_text_tokens,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        event_queue=event_queue,
+                    )
 
-                    def _emit_waveform(waveform: np.ndarray, *, is_pause: bool) -> None:
-                        nonlocal emitted_samples_total, first_audio_emitted_at_perf
-                        audio_length = int(waveform.shape[0])
-                        if first_audio_emitted_at_perf is None and not is_pause:
-                            first_audio_emitted_at_perf = time.perf_counter()
-                        emitted_samples_total += audio_length
-                        lead_seconds = 0.0
-                        if first_audio_emitted_at_perf is not None:
-                            elapsed_since_first_audio = max(0.0, time.perf_counter() - first_audio_emitted_at_perf)
-                            lead_seconds = (emitted_samples_total / float(sample_rate)) - elapsed_since_first_audio
-                        emitted_chunks.append(np.asarray(waveform, dtype=np.float32))
-                        event_queue.put(
-                            {
-                                "type": "audio",
-                                "waveform_numpy": np.asarray(waveform, dtype=np.float32),
-                                "sample_rate": sample_rate,
-                                "channels": channels,
-                                "chunk_index": chunk_index,
-                                "emitted_audio_seconds": emitted_samples_total / float(sample_rate),
-                                "lead_seconds": lead_seconds,
-                                "is_pause": bool(is_pause),
-                            }
-                        )
-
-                    def _decode_pending(force: bool) -> None:
-                        pending_count = len(pending_decode_frames)
-                        if pending_count <= 0:
-                            return
-                        decode_budget = _resolve_stream_decode_frame_budget(
-                            emitted_samples_total,
-                            sample_rate,
-                            first_audio_emitted_at_perf,
-                        )
-                        if not force and pending_count < max(1, decode_budget):
-                            return
-                        frame_budget = pending_count if force else min(pending_count, max(1, decode_budget))
-                        frame_chunk = pending_decode_frames[:frame_budget]
-                        del pending_decode_frames[:frame_budget]
-                        decoded = self.runtime.codec_streaming_session.run_frames(frame_chunk)
-                        if decoded is None:
-                            return
-                        audio, audio_length = decoded
-                        if audio_length <= 0:
-                            return
-                        waveform = _merge_audio_channels(
-                            [audio[0, channel_index, :audio_length] for channel_index in range(audio.shape[1])]
-                        )
-                        _emit_waveform(waveform, is_pause=False)
-
-                    def _on_frame(_generated_frames: list[list[int]], _step_index: int, frame: list[int]) -> None:
-                        pending_decode_frames.append(list(frame))
-                        _decode_pending(False)
-
-                    try:
-                        generated_frames = self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
-                        _decode_pending(True)
-                    finally:
-                        self.runtime.codec_streaming_session.reset()
-
-                    chunk_waveform = _concat_waveforms(emitted_chunks)
-                    all_waveforms.append(chunk_waveform)
-                    all_generated_frames.extend(generated_frames)
-
-                    if chunk_index < len(text_chunks) - 1:
-                        pause_seconds = self.runtime.estimate_voice_clone_inter_chunk_pause_seconds(chunk_text)
-                        pause_samples = max(0, int(round(sample_rate * pause_seconds)))
-                        if pause_samples > 0:
-                            pause_waveform = np.zeros((pause_samples, channels), dtype=np.float32)
-                            _emit_waveform(pause_waveform, is_pause=True)
-                            all_waveforms.append(pause_waveform)
-
-                waveform = _concat_waveforms(all_waveforms)
                 output_path = _write_waveform_to_wav(
                     self.output_dir / "app_onnx_stream_output.wav",
                     waveform,
@@ -374,6 +318,7 @@ class OnnxNanoTTSServiceAdapter:
                             voice=voice,
                             prompt_audio_path=prompt_audio_path,
                             text_chunks=text_chunks,
+                            mode=normalized_mode,
                         ),
                     }
                 )
@@ -391,6 +336,196 @@ class OnnxNanoTTSServiceAdapter:
             if str(item.get("type")) == "error":
                 raise RuntimeError(str(item.get("error") or "Unknown ONNX streaming error"))
             yield item
+
+    def _synthesize_stream_voice_clone_worker(
+        self,
+        *,
+        text: str,
+        prompt_audio_path: str | None,
+        voice: str | None,
+        voice_clone_max_text_tokens: int,
+        sample_rate: int,
+        channels: int,
+        event_queue: "queue.Queue",
+    ) -> tuple[np.ndarray, list[str]]:
+        """Voice-clone streaming worker — original logic."""
+        prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
+        text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
+        emitted_samples_total = 0
+        first_audio_emitted_at_perf: float | None = None
+        all_waveforms: list[np.ndarray] = []
+        all_generated_frames: list[list[int]] = []
+
+        for chunk_index, chunk_text in enumerate(text_chunks):
+            text_token_ids = self.runtime.encode_text(chunk_text)
+            request_rows = self.runtime.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
+            pending_decode_frames: list[list[int]] = []
+            emitted_chunks: list[np.ndarray] = []
+            self.runtime.codec_streaming_session.reset()
+
+            def _emit_waveform(waveform: np.ndarray, *, is_pause: bool) -> None:
+                nonlocal emitted_samples_total, first_audio_emitted_at_perf
+                audio_length = int(waveform.shape[0])
+                if first_audio_emitted_at_perf is None and not is_pause:
+                    first_audio_emitted_at_perf = time.perf_counter()
+                emitted_samples_total += audio_length
+                lead_seconds = 0.0
+                if first_audio_emitted_at_perf is not None:
+                    elapsed_since_first_audio = max(0.0, time.perf_counter() - first_audio_emitted_at_perf)
+                    lead_seconds = (emitted_samples_total / float(sample_rate)) - elapsed_since_first_audio
+                emitted_chunks.append(np.asarray(waveform, dtype=np.float32))
+                event_queue.put(
+                    {
+                        "type": "audio",
+                        "waveform_numpy": np.asarray(waveform, dtype=np.float32),
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "chunk_index": chunk_index,
+                        "emitted_audio_seconds": emitted_samples_total / float(sample_rate),
+                        "lead_seconds": lead_seconds,
+                        "is_pause": bool(is_pause),
+                    }
+                )
+
+            def _decode_pending(force: bool) -> None:
+                pending_count = len(pending_decode_frames)
+                if pending_count <= 0:
+                    return
+                decode_budget = _resolve_stream_decode_frame_budget(
+                    emitted_samples_total,
+                    sample_rate,
+                    first_audio_emitted_at_perf,
+                )
+                if not force and pending_count < max(1, decode_budget):
+                    return
+                frame_budget = pending_count if force else min(pending_count, max(1, decode_budget))
+                frame_chunk = pending_decode_frames[:frame_budget]
+                del pending_decode_frames[:frame_budget]
+                decoded = self.runtime.codec_streaming_session.run_frames(frame_chunk)
+                if decoded is None:
+                    return
+                audio, audio_length = decoded
+                if audio_length <= 0:
+                    return
+                waveform = _merge_audio_channels(
+                    [audio[0, channel_index, :audio_length] for channel_index in range(audio.shape[1])]
+                )
+                _emit_waveform(waveform, is_pause=False)
+
+            def _on_frame(_generated_frames: list[list[int]], _step_index: int, frame: list[int]) -> None:
+                pending_decode_frames.append(list(frame))
+                _decode_pending(False)
+
+            try:
+                generated_frames = self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
+                _decode_pending(True)
+            finally:
+                self.runtime.codec_streaming_session.reset()
+
+            chunk_waveform = _concat_waveforms(emitted_chunks)
+            all_waveforms.append(chunk_waveform)
+            all_generated_frames.extend(generated_frames)
+
+            if chunk_index < len(text_chunks) - 1:
+                pause_seconds = self.runtime.estimate_voice_clone_inter_chunk_pause_seconds(chunk_text)
+                pause_samples = max(0, int(round(sample_rate * pause_seconds)))
+                if pause_samples > 0:
+                    pause_waveform = np.zeros((pause_samples, channels), dtype=np.float32)
+                    _emit_waveform(pause_waveform, is_pause=True)
+                    all_waveforms.append(pause_waveform)
+
+        waveform = _concat_waveforms(all_waveforms)
+        return waveform, text_chunks
+
+    def _synthesize_stream_continuation_worker(
+        self,
+        *,
+        text: str,
+        prompt_text: str | None,
+        prompt_audio_path: str | None,
+        voice: str | None,
+        sample_rate: int,
+        channels: int,
+        event_queue: "queue.Queue",
+    ) -> tuple[np.ndarray, list[str]]:
+        """Continuation streaming worker."""
+        effective_text = str(prompt_text or "") + str(text or "")
+        text_token_ids = self.runtime.encode_text(effective_text)
+        prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
+        request_rows = self.runtime.build_continuation_request_rows(
+            text_token_ids=text_token_ids,
+            prompt_audio_codes=prompt_audio_codes,
+        )
+
+        emitted_samples_total = 0
+        first_audio_emitted_at_perf: float | None = None
+        pending_decode_frames: list[list[int]] = []
+        emitted_chunks: list[np.ndarray] = []
+        all_generated_frames: list[list[int]] = []
+        self.runtime.codec_streaming_session.reset()
+
+        def _emit_waveform(waveform: np.ndarray, *, is_pause: bool) -> None:
+            nonlocal emitted_samples_total, first_audio_emitted_at_perf
+            audio_length = int(waveform.shape[0])
+            if first_audio_emitted_at_perf is None and not is_pause:
+                first_audio_emitted_at_perf = time.perf_counter()
+            emitted_samples_total += audio_length
+            lead_seconds = 0.0
+            if first_audio_emitted_at_perf is not None:
+                elapsed_since_first_audio = max(0.0, time.perf_counter() - first_audio_emitted_at_perf)
+                lead_seconds = (emitted_samples_total / float(sample_rate)) - elapsed_since_first_audio
+            emitted_chunks.append(np.asarray(waveform, dtype=np.float32))
+            event_queue.put(
+                {
+                    "type": "audio",
+                    "waveform_numpy": np.asarray(waveform, dtype=np.float32),
+                    "sample_rate": sample_rate,
+                    "channels": channels,
+                    "chunk_index": 0,
+                    "emitted_audio_seconds": emitted_samples_total / float(sample_rate),
+                    "lead_seconds": lead_seconds,
+                    "is_pause": bool(is_pause),
+                }
+            )
+
+        def _decode_pending(force: bool) -> None:
+            pending_count = len(pending_decode_frames)
+            if pending_count <= 0:
+                return
+            decode_budget = _resolve_stream_decode_frame_budget(
+                emitted_samples_total,
+                sample_rate,
+                first_audio_emitted_at_perf,
+            )
+            if not force and pending_count < max(1, decode_budget):
+                return
+            frame_budget = pending_count if force else min(pending_count, max(1, decode_budget))
+            frame_chunk = pending_decode_frames[:frame_budget]
+            del pending_decode_frames[:frame_budget]
+            decoded = self.runtime.codec_streaming_session.run_frames(frame_chunk)
+            if decoded is None:
+                return
+            audio, audio_length = decoded
+            if audio_length <= 0:
+                return
+            waveform = _merge_audio_channels(
+                [audio[0, channel_index, :audio_length] for channel_index in range(audio.shape[1])]
+            )
+            _emit_waveform(waveform, is_pause=False)
+
+        def _on_frame(_generated_frames: list[list[int]], _step_index: int, frame: list[int]) -> None:
+            pending_decode_frames.append(list(frame))
+            _decode_pending(False)
+
+        try:
+            generated_frames = self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
+            _decode_pending(True)
+            all_generated_frames.extend(generated_frames)
+        finally:
+            self.runtime.codec_streaming_session.reset()
+
+        waveform = _concat_waveforms(emitted_chunks)
+        return waveform, [effective_text]
 
 
 class OnnxRequestRuntimeManager:

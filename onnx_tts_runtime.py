@@ -323,6 +323,20 @@ class OnnxTtsRuntime(OrtCpuRuntime):
     def count_text_tokens(self, text: str) -> int:
         return len(self.encode_text(text))
 
+    def build_continuation_request_rows(
+        self,
+        text_token_ids: list[int],
+        prompt_audio_codes: list[list[int]] | None = None,
+        none_token_ids: list[int] | None = None,
+    ) -> dict[str, list[list[int]]]:
+        """Override to encode 'None' via the SentencePiece model."""
+        none_token_ids = self.encode_text("None")
+        return super().build_continuation_request_rows(
+            text_token_ids=text_token_ids,
+            prompt_audio_codes=prompt_audio_codes,
+            none_token_ids=none_token_ids,
+        )
+
     def prepare_synthesis_text(
         self,
         *,
@@ -593,18 +607,41 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "waveform": waveform,
         }
 
+    def _resolve_inference_mode(
+        self,
+        mode: str,
+        has_prompt_text: bool,
+        has_prompt_audio: bool,
+    ) -> str:
+        normalized_mode = str(mode or "voice_clone").strip().lower() or "voice_clone"
+        if normalized_mode not in {"continuation", "voice_clone"}:
+            raise ValueError(f"Unsupported inference mode {mode!r}.")
+        if normalized_mode == "voice_clone":
+            if not has_prompt_audio:
+                raise ValueError("voice_clone mode requires prompt_audio_path or a built-in voice.")
+            if has_prompt_text:
+                raise ValueError("voice_clone mode does not accept prompt_text.")
+        elif has_prompt_text != has_prompt_audio:
+            raise ValueError(
+                "continuation mode with prompt_text also requires prompt_audio_path "
+                "(and vice-versa for prompt-audio continuation)."
+            )
+        return normalized_mode
+
     def synthesize(
         self,
         *,
         text: str,
         voice: str | None = None,
         prompt_audio_path: str | Path | None = None,
+        prompt_text: str | None = None,
         output_audio_path: str | Path | None = None,
         sample_mode: str | None = None,
         do_sample: bool = True,
         streaming: bool = False,
         max_new_frames: int | None = None,
         voice_clone_max_text_tokens: int = 75,
+        mode: str = "voice_clone",
         enable_wetext: bool = True,
         enable_normalize_tts_text: bool = True,
         seed: int | None = None,
@@ -616,6 +653,27 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         self.manifest["generation_defaults"]["do_sample"] = normalized_sample_mode != SAMPLE_MODE_GREEDY
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
+
+        resolved_mode = self._resolve_inference_mode(
+            mode=mode,
+            has_prompt_text=(prompt_text is not None and str(prompt_text).strip() != ""),
+            has_prompt_audio=(prompt_audio_path is not None),
+        )
+
+        # ---- continuation mode ----
+        if resolved_mode == "continuation":
+            return self._synthesize_continuation(
+                text=text,
+                prompt_text=str(prompt_text or ""),
+                prompt_audio_path=prompt_audio_path,
+                output_audio_path=output_audio_path,
+                streaming=streaming,
+                max_new_frames=max_new_frames,
+                voice=voice,
+                seed=seed,
+            )
+
+        # ---- voice_clone mode (original path) ----
         prepared_texts = self.prepare_synthesis_text(
             text=text,
             voice=str(voice or ""),
@@ -663,3 +721,111 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "streaming": bool(streaming),
             "chunk_results": chunk_results,
         }
+
+    def _synthesize_continuation(
+        self,
+        *,
+        text: str,
+        prompt_text: str,
+        prompt_audio_path: str | Path | None,
+        output_audio_path: str | Path | None,
+        streaming: bool,
+        max_new_frames: int | None,
+        voice: str | None,
+        seed: int | None,
+    ) -> dict[str, Any]:
+        """Run continuation-mode synthesis: prompt_text + text is spoken,
+        continuing from the provided prompt_audio_path."""
+        effective_text = str(prompt_text or "") + str(text or "")
+        text_token_ids = self.encode_text(effective_text)
+        prompt_audio_codes = self.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
+
+        request_rows = self.build_continuation_request_rows(
+            text_token_ids=text_token_ids,
+            prompt_audio_codes=prompt_audio_codes,
+        )
+
+        sample_rate = int(self.codec_meta["codec_config"]["sample_rate"])
+        channels = int(self.codec_meta["codec_config"]["channels"])
+
+        if not streaming:
+            generated_frames = self.generate_audio_frames(request_rows)
+            waveform = self.decode_full_audio_safe(generated_frames)
+        else:
+            waveform = self._synthesize_continuation_streaming(
+                request_rows=request_rows,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
+            generated_frames = []
+
+        resolved_output_audio_path = (
+            Path(output_audio_path).expanduser().resolve()
+            if output_audio_path
+            else (self.output_dir / DEFAULT_BROWSER_ONNX_OUTPUT_PATH.name).resolve()
+        )
+        audio_path = _write_waveform_to_wav(resolved_output_audio_path, waveform, sample_rate)
+
+        return {
+            "audio_path": str(audio_path),
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "audio_token_ids": np.asarray(generated_frames, dtype=np.int32) if generated_frames else np.zeros((0, 0), dtype=np.int32),
+            "text_chunks": [effective_text],
+            "prepared_texts": {"text": effective_text, "prompt_text": prompt_text},
+            "sample_mode": self.manifest["generation_defaults"]["sample_mode"],
+            "do_sample": self.manifest["generation_defaults"]["do_sample"],
+            "streaming": bool(streaming),
+            "chunk_results": [],
+        }
+
+    def _synthesize_continuation_streaming(
+        self,
+        *,
+        request_rows: dict[str, list[list[int]]],
+        sample_rate: int,
+        channels: int,
+    ) -> np.ndarray:
+        """Streaming decode for continuation mode (non-chunked)."""
+        pending_decode_frames: list[list[int]] = []
+        emitted_chunks: list[np.ndarray] = []
+        emitted_samples_total = 0
+        first_audio_emitted_at_perf: float | None = None
+        self.codec_streaming_session.reset()
+
+        def decode_pending_frames(force: bool) -> None:
+            nonlocal emitted_samples_total, first_audio_emitted_at_perf
+            pending_count = len(pending_decode_frames)
+            if pending_count <= 0:
+                return
+            decode_budget = _resolve_stream_decode_frame_budget(
+                emitted_samples_total,
+                sample_rate,
+                first_audio_emitted_at_perf,
+            )
+            if not force and pending_count < max(1, decode_budget):
+                return
+            frame_budget = pending_count if force else min(pending_count, max(1, decode_budget))
+            frame_chunk = pending_decode_frames[:frame_budget]
+            del pending_decode_frames[:frame_budget]
+            decoded = self.codec_streaming_session.run_frames(frame_chunk)
+            if decoded is None:
+                return
+            audio, audio_length = decoded
+            if audio_length <= 0:
+                return
+            if first_audio_emitted_at_perf is None:
+                first_audio_emitted_at_perf = time.perf_counter()
+            emitted_samples_total += audio_length
+            emitted_chunks.append(_merge_audio_channels([audio[0, ci, :audio_length] for ci in range(audio.shape[1])]))
+
+        def on_frame(_gf: list[list[int]], _si: int, frame: list[int]) -> None:
+            pending_decode_frames.append(list(frame))
+            decode_pending_frames(False)
+
+        try:
+            self.generate_audio_frames(request_rows, on_frame=on_frame)
+            decode_pending_frames(True)
+        finally:
+            self.codec_streaming_session.reset()
+        return _concat_waveforms(emitted_chunks)
